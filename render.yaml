@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: nure-backend
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PALOMA_API_KEY
+        value: efdd95a2708c19ecdeb3d21bac81b834nure29007
+      - key: JWT_SECRET
+        generateValue: true
+      - key: FRONTEND_URL
+        value: "*"
+    disk:
+      name: nure-data
+      mountPath: /opt/render/project/src/data
+      sizeGB: 1
