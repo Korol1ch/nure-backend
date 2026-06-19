@@ -202,16 +202,14 @@ app.post('/api/auth/change-password', authMiddleware, async (req, res) => {
 //  ПУБЛИЧНЫЕ МАРШРУТЫ ТОВАРОВ
 // ══════════════════════════════════════
 
-// GET /api/products — только активные товары (isActive !== false)
+// GET /api/products — все активные + деактивированные (помечены outOfStock)
 app.get('/api/products', (req, res) => {
   purgeExpiredProducts();
   const products = readJSON('products.json', []);
-  const visible = products
-    .filter(p => p.isActive !== false)
-    .map(p => ({
-      ...p,
-      outOfStock: !!p.deactivatedAt
-    }));
+  const visible = products.map(p => ({
+    ...p,
+    outOfStock: !!p.deactivatedAt
+  }));
   res.json({ success: true, products: visible });
 });
 
@@ -403,30 +401,6 @@ if (fs.existsSync(PUBLIC_DIR)) {
 }
 
 // ══════════════════════════════════════
-//  KEEP-ALIVE (Render free tier не засыпает)
-// ══════════════════════════════════════
-function startKeepAlive() {
-  const SELF_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
-  setInterval(async () => {
-    try {
-      const http = require('http');
-      const https = require('https');
-      const url = new URL(SELF_URL + '/api');
-      const client = url.protocol === 'https:' ? https : http;
-      client.get(url.href, (res) => {
-        console.log(`💓 Keep-alive ping → ${res.statusCode}`);
-        res.resume();
-      }).on('error', (err) => {
-        console.log(`⚠️  Keep-alive ошибка: ${err.message}`);
-      });
-    } catch (e) {
-      console.log('⚠️  Keep-alive ошибка:', e.message);
-    }
-  }, 14 * 60 * 1000); // каждые 14 минут
-  console.log('   💓 Keep-alive активирован (пинг каждые 14 мин)');
-}
-
-// ══════════════════════════════════════
 //  ЗАПУСК
 // ══════════════════════════════════════
 initData();
@@ -435,5 +409,4 @@ app.listen(PORT, () => {
   console.log(`\n🚀 NURE Backend запущен на порту ${PORT}`);
   console.log(`   API: http://localhost:${PORT}/api`);
   console.log(`   Admin: ${ADMIN_EMAIL}`);
-  startKeepAlive();
 });
