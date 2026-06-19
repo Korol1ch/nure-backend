@@ -1,10 +1,12 @@
 /**
- * NURE Shop Backend v3.0
- * - Локальное хранилище товаров (products.json)
+ * NURE Shop Backend v4.0
+ * - Реальная интеграция с Paloma365 (метод guide2xml / таблица s_items)
+ * - Товары (название, цена, описание, категория) подтягиваются из Paloma365 в реальном времени
+ * - Admin добавляет "поверх" товара: фото, цвета, размеры, бейдж, описание-переопределение,
+ *   видимость в каталоге (т.к. Paloma365 не отдаёт остатки без индивидуальной настройки —
+ *   см. комментарий у fetchPalomaStock ниже)
  * - JWT Auth (users + admin)
- * - Product enrichment (photos, descriptions, colors)
- * - File uploads for product images
- * - Деактивация товаров: неделю показывается как "нет в наличии", потом удаляется
+ * - Локальные заказы (orders.json)
  */
 
 const express  = require('express');
@@ -25,7 +27,10 @@ const PORT = process.env.PORT || 3000;
 const JWT_SECRET   = process.env.JWT_SECRET || 'nure_secret_2025_change_in_production';
 const ADMIN_EMAIL  = 'ismagulshakarim0909@gmail.com';
 const FRONTEND_URL = process.env.FRONTEND_URL || '*';
-const ONE_WEEK_MS  = 7 * 24 * 60 * 60 * 1000;
+
+const PALOMA_API_KEY  = process.env.PALOMA_API_KEY || 'efdd95a2708c19ecdeb3d21bac81b834nure29007';
+const PALOMA_BASE_URL = 'https://api.paloma365.com/company/api/';
+const PALOMA_CACHE_TTL_MS = 5 * 60 * 1000; // обновляем кэш товаров раз в 5 минут
 
 // ══════════════════════════════════════
 //  ХРАНИЛИЩЕ ДАННЫХ (JSON файлы)
@@ -45,9 +50,7 @@ function writeJSON(file, data) {
   fs.writeFileSync(path.join(DATA_DIR, file), JSON.stringify(data, null, 2));
 }
 
-// Инициализация данных
 function initData() {
-  // Создать админа если нет
   const users = readJSON('users.json', []);
   if (!users.find(u => u.email === ADMIN_EMAIL)) {
     const hashed = bcrypt.hashSync('admin123', 10);
@@ -59,40 +62,123 @@ function initData() {
     console.log('✅ Admin account created:', ADMIN_EMAIL, '/ password: admin123');
     console.log('   ⚠️  Смените пароль после первого входа!');
   }
-  // Инициализация products.json если нет
-  if (!fs.existsSync(path.join(DATA_DIR, 'products.json'))) {
-    writeJSON('products.json', []);
+  if (!fs.existsSync(path.join(DATA_DIR, 'enrichments.json'))) {
+    writeJSON('enrichments.json', {});
   }
 }
 
 // ══════════════════════════════════════
-//  АВТОУДАЛЕНИЕ ДЕАКТИВИРОВАННЫХ ТОВАРОВ
+//  PALOMA365 — ПОЛУЧЕНИЕ ТОВАРОВ
 // ══════════════════════════════════════
-function purgeExpiredProducts() {
-  const products = readJSON('products.json', []);
+// Документация: https://help.paloma365.com/knowledgebase/api-dok/
+// Реальный метод (используется в их официальных примерах для 1С/сайтов):
+//   GET https://api.paloma365.com/company/api/?class=guide2xml&method=to_file
+//       &tables[0]=s_items&output_format=json&authkey=AUTHKEY
+// Ответ: { "s_items": { "<id>": { name, price, description, articul, parentid, isgroup, ... } } }
+// Товары — это записи с isgroup="0", категории (группы) — записи с isgroup="1",
+// у товара "parentid" указывает на UID его категории.
+
+let palomaCache = { products: [], categories: {}, fetchedAt: 0, lastError: null };
+
+function cleanNull(v) {
+  if (v === null || v === undefined) return '';
+  if (typeof v === 'string' && v.trim().toUpperCase() === 'NULL') return '';
+  return typeof v === 'string' ? v.trim() : v;
+}
+
+async function fetchPalomaRaw() {
+  const url = `${PALOMA_BASE_URL}?class=guide2xml&method=to_file&tables%5B0%5D=s_items&output_format=json&authkey=${encodeURIComponent(PALOMA_API_KEY)}`;
+  const ctrl  = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 20000);
+  try {
+    const response = await fetch(url, { signal: ctrl.signal });
+    const text = await response.text();
+    let json;
+    try { json = JSON.parse(text); }
+    catch { throw new Error('Paloma365 вернула не-JSON ответ (возможно неверный authkey или метод недоступен): ' + text.slice(0, 300)); }
+    if (json && json.errors) throw new Error('Paloma365 API: ' + json.errors);
+    return json;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ⚠️ ОСТАТКИ (наличие на складе)
+// Paloma365 не отдаёт остатки через guide2xml/s_items. Согласно официальному сайту
+// Paloma365 ("Выгрузка данных из Paloma365 в интернет-магазин: Наименование, Стоимость,
+// Остатки — интеграция требует индивидуальной настройки"), для остатков нужно отдельно
+// согласовать с поддержкой Paloma365 (help@paloma365.com / WhatsApp в их Help-центре)
+// конкретный метод API для вашего аккаунта — по аналогии с их методом для Kaspi Магазина
+// (class=dev7\KaspiRemains). Когда вам выдадут такой метод — впишите его сюда,
+// и в getPalomaCatalog() ниже останется добавить пару строк для подмешивания остатков.
+async function fetchPalomaStock() {
+  return null; // пока не подключено
+}
+
+async function getPalomaCatalog(force = false) {
   const now = Date.now();
-  const filtered = products.filter(p => {
-    if (p.deactivatedAt) {
-      const elapsed = now - new Date(p.deactivatedAt).getTime();
-      if (elapsed >= ONE_WEEK_MS) {
-        // Удалить файлы изображений
-        try {
-          const imgDir = path.join(UPLOADS_DIR, p.slug || p.id);
-          if (fs.existsSync(imgDir)) fs.rmSync(imgDir, { recursive: true });
-        } catch {}
-        console.log(`🗑️  Товар "${p.name}" удалён (прошла неделя после деактивации)`);
-        return false;
-      }
+  if (!force && palomaCache.products.length && (now - palomaCache.fetchedAt) < PALOMA_CACHE_TTL_MS) {
+    return palomaCache;
+  }
+  try {
+    const raw   = await fetchPalomaRaw();
+    const items = (raw && raw.s_items) || {};
+
+    const categories = {};
+    for (const it of Object.values(items)) {
+      if (String(it.isgroup) === '1') categories[it.UID] = cleanNull(it.name);
     }
-    return true;
-  });
-  if (filtered.length !== products.length) {
-    writeJSON('products.json', filtered);
+
+    const products = [];
+    for (const [key, it] of Object.entries(items)) {
+      if (String(it.isgroup) === '1') continue; // это категория, не товар
+      products.push({
+        palomaId:     key,
+        uid:          it.UID || key,
+        name:         cleanNull(it.name) || 'Без названия',
+        price:        parseFloat(it.price) || 0,
+        description:  cleanNull(it.description),
+        articul:      cleanNull(it.articul),
+        barcode:      cleanNull(it.mainShtrih),
+        categoryUid:  it.parentid,
+        categoryName: categories[it.parentid] || '',
+      });
+    }
+
+    palomaCache = { products, categories, fetchedAt: now, lastError: null };
+    return palomaCache;
+  } catch (err) {
+    palomaCache.lastError = err.message;
+    if (palomaCache.products.length) {
+      // Paloma недоступна — отдаём то, что было закэшировано раньше, чтобы сайт не падал
+      return palomaCache;
+    }
+    throw err;
   }
 }
 
-// Запускаем проверку раз в час
-setInterval(purgeExpiredProducts, 60 * 60 * 1000);
+// ══════════════════════════════════════
+//  ОБЪЕДИНЕНИЕ: Paloma365 + ручные данные админа (enrichments.json)
+// ══════════════════════════════════════
+function mergeProduct(p, enrich) {
+  enrich = enrich || {};
+  return {
+    id:           p.palomaId,
+    articul:      p.articul,
+    name:         p.name,
+    price:        p.price,
+    description:  enrich.description ? enrich.description : p.description,
+    category:     enrich.category || p.categoryName || '',
+    palomaCategory: p.categoryName || '',
+    badge:        enrich.badge || '',
+    sizes:        enrich.sizes || [],
+    colors:       enrich.colors || [],
+    images:       enrich.images || { default: [] },
+    hidden:       !!enrich.hidden,
+    hasPhotos:    !!(enrich.images && Object.values(enrich.images).some(arr => Array.isArray(arr) && arr.length)),
+    updatedAt:    enrich.updatedAt || null,
+  };
+}
 
 // ══════════════════════════════════════
 //  MIDDLEWARE
@@ -126,7 +212,7 @@ function adminMiddleware(req, res, next) {
 // Multer
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
-    const slug = req.params.slug || req.params.id || 'misc';
+    const slug = req.params.id || 'misc';
     const dir  = path.join(UPLOADS_DIR, slug);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     cb(null, dir);
@@ -141,7 +227,7 @@ const upload = multer({ storage, limits: { fileSize: 10 * 1024 * 1024 } });
 //  HEALTH CHECK
 // ══════════════════════════════════════
 app.get('/api', (req, res) => {
-  res.json({ status: 'ok', service: 'NURE Backend v3.0', time: new Date().toISOString() });
+  res.json({ status: 'ok', service: 'NURE Backend v4.0', time: new Date().toISOString() });
 });
 
 // ══════════════════════════════════════
@@ -199,29 +285,39 @@ app.post('/api/auth/change-password', authMiddleware, async (req, res) => {
 });
 
 // ══════════════════════════════════════
-//  ПУБЛИЧНЫЕ МАРШРУТЫ ТОВАРОВ
+//  ПУБЛИЧНЫЕ МАРШРУТЫ ТОВАРОВ (из Paloma365 + enrichments)
 // ══════════════════════════════════════
 
-// GET /api/products — все активные + деактивированные (помечены outOfStock)
-app.get('/api/products', (req, res) => {
-  purgeExpiredProducts();
-  const products = readJSON('products.json', []);
-  const visible = products.map(p => ({
-    ...p,
-    outOfStock: !!p.deactivatedAt
-  }));
-  res.json({ success: true, products: visible });
+app.get('/api/products', async (req, res) => {
+  try {
+    const catalog     = await getPalomaCatalog();
+    const enrichments = readJSON('enrichments.json', {});
+    const products = catalog.products
+      .filter(p => !(enrichments[p.palomaId] && enrichments[p.palomaId].hidden))
+      .map(p => mergeProduct(p, enrichments[p.palomaId]));
+    res.json({
+      success: true,
+      products,
+      syncedAt: catalog.fetchedAt,
+      offline: !!catalog.lastError
+    });
+  } catch (err) {
+    res.status(503).json({ success: false, error: 'Не удалось получить товары из Paloma365: ' + err.message });
+  }
 });
 
-// GET /api/products/:id — один товар
-app.get('/api/products/:id', (req, res) => {
-  const products = readJSON('products.json', []);
-  const product  = products.find(p => p.id === req.params.id || p.slug === req.params.id);
-  if (!product) return res.status(404).json({ error: 'Товар не найден' });
-  res.json({ success: true, product: { ...product, outOfStock: !!product.deactivatedAt } });
+app.get('/api/products/:id', async (req, res) => {
+  try {
+    const catalog = await getPalomaCatalog();
+    const p = catalog.products.find(x => x.palomaId === req.params.id || x.articul === req.params.id);
+    if (!p) return res.status(404).json({ error: 'Товар не найден' });
+    const enrichments = readJSON('enrichments.json', {});
+    res.json({ success: true, product: mergeProduct(p, enrichments[p.palomaId]) });
+  } catch (err) {
+    res.status(503).json({ success: false, error: 'Не удалось получить товар из Paloma365: ' + err.message });
+  }
 });
 
-// POST /api/order — создать заказ (сохраняем локально)
 app.post('/api/order', authMiddleware, (req, res) => {
   try {
     const orders = readJSON('orders.json', []);
@@ -239,104 +335,82 @@ app.post('/api/order', authMiddleware, (req, res) => {
 });
 
 // ══════════════════════════════════════
-//  ADMIN — ТОВАРЫ
+//  ADMIN — ТОВАРЫ (только "обогащение" Paloma-товаров, без ручного создания)
 // ══════════════════════════════════════
 
-// GET /api/admin/products — все товары для админа (включая деактивированные)
-app.get('/api/admin/products', adminMiddleware, (req, res) => {
-  const products = readJSON('products.json', []);
-  res.json({ success: true, products });
+// GET /api/admin/products — все товары из Paloma + статус синхронизации
+app.get('/api/admin/products', adminMiddleware, async (req, res) => {
+  try {
+    const catalog      = await getPalomaCatalog();
+    const enrichments  = readJSON('enrichments.json', {});
+    const products = catalog.products.map(p => mergeProduct(p, enrichments[p.palomaId]));
+    res.json({
+      success: true,
+      products,
+      syncedAt: catalog.fetchedAt,
+      lastError: catalog.lastError
+    });
+  } catch (err) {
+    res.status(503).json({ success: false, error: 'Не удалось получить товары из Paloma365: ' + err.message });
+  }
 });
 
-// POST /api/admin/products — создать товар
-app.post('/api/admin/products', adminMiddleware, (req, res) => {
+// POST /api/admin/sync — принудительно обновить кэш товаров из Paloma365
+app.post('/api/admin/sync', adminMiddleware, async (req, res) => {
   try {
-    const { name, price, category, description, badge, sizes, colors } = req.body;
-    if (!name) return res.status(400).json({ error: 'Название обязательно' });
+    const catalog = await getPalomaCatalog(true);
+    res.json({ success: true, count: catalog.products.length, syncedAt: catalog.fetchedAt });
+  } catch (err) {
+    res.status(503).json({ success: false, error: err.message });
+  }
+});
 
-    const products = readJSON('products.json', []);
-    const id   = uuidv4();
-    const slug = slugify(name) + '-' + id.slice(0, 6);
-    const product = {
-      id, slug, name,
-      price:       price || 0,
-      category:    category || '',
-      description: description || '',
-      badge:       badge || '',
-      sizes:       sizes || [],
-      colors:      colors || [],
-      images:      { default: [] },
-      isActive:    true,
-      createdAt:   new Date().toISOString()
+// PUT /api/admin/products/:id — обновить "обогащение" товара (фото НЕ здесь, см. ниже)
+app.put('/api/admin/products/:id', adminMiddleware, async (req, res) => {
+  try {
+    const { description, category, badge, sizes, colors, hidden } = req.body;
+    const enrichments = readJSON('enrichments.json', {});
+    const current = enrichments[req.params.id] || {};
+    enrichments[req.params.id] = {
+      ...current,
+      ...(description !== undefined && { description }),
+      ...(category    !== undefined && { category }),
+      ...(badge       !== undefined && { badge }),
+      ...(sizes       !== undefined && { sizes }),
+      ...(colors      !== undefined && { colors }),
+      ...(hidden      !== undefined && { hidden }),
+      updatedAt: new Date().toISOString()
     };
-    products.push(product);
-    writeJSON('products.json', products);
+    writeJSON('enrichments.json', enrichments);
+
+    let product;
+    try {
+      const catalog = await getPalomaCatalog();
+      const p = catalog.products.find(x => x.palomaId === req.params.id);
+      product = p ? mergeProduct(p, enrichments[req.params.id]) : null;
+    } catch { /* Paloma временно недоступна — данные уже сохранены, просто не можем обогатить ответ */ }
+    if (!product) product = { id: req.params.id, ...enrichments[req.params.id] };
+
     res.json({ success: true, product });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// PUT /api/admin/products/:id — редактировать товар
-app.put('/api/admin/products/:id', adminMiddleware, (req, res) => {
-  try {
-    const products = readJSON('products.json', []);
-    const idx = products.findIndex(p => p.id === req.params.id);
-    if (idx === -1) return res.status(404).json({ error: 'Товар не найден' });
-
-    const allowed = ['name', 'price', 'category', 'description', 'badge', 'sizes', 'colors'];
-    allowed.forEach(key => {
-      if (req.body[key] !== undefined) products[idx][key] = req.body[key];
-    });
-    products[idx].updatedAt = new Date().toISOString();
-    writeJSON('products.json', products);
-    res.json({ success: true, product: products[idx] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// POST /api/admin/products/:id/deactivate — деактивировать товар
-app.post('/api/admin/products/:id/deactivate', adminMiddleware, (req, res) => {
-  try {
-    const products = readJSON('products.json', []);
-    const idx = products.findIndex(p => p.id === req.params.id);
-    if (idx === -1) return res.status(404).json({ error: 'Товар не найден' });
-
-    products[idx].isActive     = false;
-    products[idx].deactivatedAt = new Date().toISOString();
-    writeJSON('products.json', products);
-    console.log(`⏸️  Товар "${products[idx].name}" деактивирован — удалится через 7 дней`);
-    res.json({ success: true, product: products[idx] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// POST /api/admin/products/:id/activate — реактивировать товар
-app.post('/api/admin/products/:id/activate', adminMiddleware, (req, res) => {
-  try {
-    const products = readJSON('products.json', []);
-    const idx = products.findIndex(p => p.id === req.params.id);
-    if (idx === -1) return res.status(404).json({ error: 'Товар не найден' });
-
-    products[idx].isActive      = true;
-    delete products[idx].deactivatedAt;
-    writeJSON('products.json', products);
-    res.json({ success: true, product: products[idx] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// POST /api/admin/products/:id/images — загрузить фото
+// POST /api/admin/products/:id/images — загрузить фото товара
 app.post('/api/admin/products/:id/images', adminMiddleware, upload.array('images', 10), (req, res) => {
   try {
-    const products = readJSON('products.json', []);
-    const idx = products.findIndex(p => p.id === req.params.id);
-    if (idx === -1) return res.status(404).json({ error: 'Товар не найден' });
-
     const colorKey = req.body.colorKey || 'default';
     const baseUrl  = `${req.protocol}://${req.get('host')}`;
-    const slug     = products[idx].slug || req.params.id;
-    const urls     = req.files.map(f => `${baseUrl}/uploads/${slug}/${f.filename}`);
+    const urls     = req.files.map(f => `${baseUrl}/uploads/${req.params.id}/${f.filename}`);
 
-    if (!products[idx].images) products[idx].images = {};
-    if (!products[idx].images[colorKey]) products[idx].images[colorKey] = [];
-    products[idx].images[colorKey].push(...urls);
-    writeJSON('products.json', products);
+    const enrichments = readJSON('enrichments.json', {});
+    const enrich = enrichments[req.params.id] || {};
+    if (!enrich.images) enrich.images = {};
+    if (!enrich.images[colorKey]) enrich.images[colorKey] = [];
+    enrich.images[colorKey].push(...urls);
+    enrich.updatedAt = new Date().toISOString();
+    enrichments[req.params.id] = enrich;
+    writeJSON('enrichments.json', enrichments);
+
     res.json({ success: true, urls, colorKey });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -345,18 +419,17 @@ app.post('/api/admin/products/:id/images', adminMiddleware, upload.array('images
 app.delete('/api/admin/products/:id/images', adminMiddleware, (req, res) => {
   try {
     const { url, colorKey = 'default' } = req.body;
-    const products = readJSON('products.json', []);
-    const idx = products.findIndex(p => p.id === req.params.id);
-    if (idx === -1) return res.status(404).json({ error: 'Товар не найден' });
-
-    if (products[idx].images && products[idx].images[colorKey]) {
-      products[idx].images[colorKey] = products[idx].images[colorKey].filter(u => u !== url);
+    const enrichments = readJSON('enrichments.json', {});
+    const enrich = enrichments[req.params.id] || {};
+    if (enrich.images && enrich.images[colorKey]) {
+      enrich.images[colorKey] = enrich.images[colorKey].filter(u => u !== url);
       try {
-        const slug     = products[idx].slug || req.params.id;
         const filename = path.basename(url);
-        fs.unlinkSync(path.join(UPLOADS_DIR, slug, filename));
+        fs.unlinkSync(path.join(UPLOADS_DIR, req.params.id, filename));
       } catch {}
-      writeJSON('products.json', products);
+      enrich.updatedAt = new Date().toISOString();
+      enrichments[req.params.id] = enrich;
+      writeJSON('enrichments.json', enrichments);
     }
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -373,22 +446,6 @@ app.get('/api/admin/orders', adminMiddleware, (req, res) => {
   res.json({ orders: readJSON('orders.json', []) });
 });
 
-// ══════════════════════════════════════
-//  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-// ══════════════════════════════════════
-function slugify(str) {
-  return String(str)
-    .toLowerCase()
-    .replace(/[а-яё]/g, c => {
-      const map = {а:'a',б:'b',в:'v',г:'g',д:'d',е:'e',ё:'yo',ж:'zh',з:'z',и:'i',й:'y',к:'k',л:'l',м:'m',н:'n',о:'o',п:'p',р:'r',с:'s',т:'t',у:'u',ф:'f',х:'h',ц:'ts',ч:'ch',ш:'sh',щ:'sch',ъ:'',ы:'y',ь:'',э:'e',ю:'yu',я:'ya'};
-      return map[c] || c;
-    })
-    .replace(/\s+/g, '-')
-    .replace(/[^a-z0-9-]/g, '')
-    .replace(/-+/g, '-')
-    .trim();
-}
-
 // SPA fallback
 if (fs.existsSync(PUBLIC_DIR)) {
   app.get('*', (req, res) => {
@@ -404,7 +461,10 @@ if (fs.existsSync(PUBLIC_DIR)) {
 //  ЗАПУСК
 // ══════════════════════════════════════
 initData();
-purgeExpiredProducts();
+getPalomaCatalog().then(
+  c => console.log(`✅ Paloma365: загружено ${c.products.length} товаров`),
+  e => console.warn('⚠️  Paloma365 пока недоступна при старте:', e.message, '— сайт попробует снова при первом запросе')
+);
 app.listen(PORT, () => {
   console.log(`\n🚀 NURE Backend запущен на порту ${PORT}`);
   console.log(`   API: http://localhost:${PORT}/api`);
