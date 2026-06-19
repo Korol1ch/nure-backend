@@ -1,14 +1,14 @@
 /**
- * NURE Shop Backend v2.0
- * - Paloma365 proxy (CORS fix)
+ * NURE Shop Backend v3.0
+ * - Локальное хранилище товаров (products.json)
  * - JWT Auth (users + admin)
  * - Product enrichment (photos, descriptions, colors)
  * - File uploads for product images
+ * - Деактивация товаров: неделю показывается как "нет в наличии", потом удаляется
  */
 
 const express  = require('express');
 const cors     = require('cors');
-const fetch    = require('node-fetch');
 const bcrypt   = require('bcryptjs');
 const jwt      = require('jsonwebtoken');
 const multer   = require('multer');
@@ -22,11 +22,10 @@ const PORT = process.env.PORT || 3000;
 // ══════════════════════════════════════
 //  КОНФИГ
 // ══════════════════════════════════════
-const PALOMA_API_KEY  = process.env.PALOMA_API_KEY  || 'efdd95a2708c19ecdeb3d21bac81b834nure29007';
-const PALOMA_BASE_URL = 'https://api.paloma365.com/company/api/';
-const JWT_SECRET      = process.env.JWT_SECRET || 'nure_secret_2025_change_in_production';
-const ADMIN_EMAIL     = 'ismagulshakarim0909@gmail.com';
-const FRONTEND_URL    = process.env.FRONTEND_URL || '*';
+const JWT_SECRET   = process.env.JWT_SECRET || 'nure_secret_2025_change_in_production';
+const ADMIN_EMAIL  = 'ismagulshakarim0909@gmail.com';
+const FRONTEND_URL = process.env.FRONTEND_URL || '*';
+const ONE_WEEK_MS  = 7 * 24 * 60 * 60 * 1000;
 
 // ══════════════════════════════════════
 //  ХРАНИЛИЩЕ ДАННЫХ (JSON файлы)
@@ -46,47 +45,67 @@ function writeJSON(file, data) {
   fs.writeFileSync(path.join(DATA_DIR, file), JSON.stringify(data, null, 2));
 }
 
-// Инициализация: создать админа если нет
+// Инициализация данных
 function initData() {
+  // Создать админа если нет
   const users = readJSON('users.json', []);
-  const adminExists = users.find(u => u.email === ADMIN_EMAIL);
-  if (!adminExists) {
+  if (!users.find(u => u.email === ADMIN_EMAIL)) {
     const hashed = bcrypt.hashSync('admin123', 10);
     users.push({
-      id: uuidv4(),
-      email: ADMIN_EMAIL,
-      password: hashed,
-      name: 'Ismagul',
-      role: 'admin',
-      createdAt: new Date().toISOString()
+      id: uuidv4(), email: ADMIN_EMAIL, password: hashed,
+      name: 'Ismagul', role: 'admin', createdAt: new Date().toISOString()
     });
     writeJSON('users.json', users);
     console.log('✅ Admin account created:', ADMIN_EMAIL, '/ password: admin123');
     console.log('   ⚠️  Смените пароль после первого входа!');
   }
-  // Инициализация enrichments если нет
-  if (!fs.existsSync(path.join(DATA_DIR, 'enrichments.json'))) {
-    writeJSON('enrichments.json', {});
+  // Инициализация products.json если нет
+  if (!fs.existsSync(path.join(DATA_DIR, 'products.json'))) {
+    writeJSON('products.json', []);
   }
 }
 
 // ══════════════════════════════════════
+//  АВТОУДАЛЕНИЕ ДЕАКТИВИРОВАННЫХ ТОВАРОВ
+// ══════════════════════════════════════
+function purgeExpiredProducts() {
+  const products = readJSON('products.json', []);
+  const now = Date.now();
+  const filtered = products.filter(p => {
+    if (p.deactivatedAt) {
+      const elapsed = now - new Date(p.deactivatedAt).getTime();
+      if (elapsed >= ONE_WEEK_MS) {
+        // Удалить файлы изображений
+        try {
+          const imgDir = path.join(UPLOADS_DIR, p.slug || p.id);
+          if (fs.existsSync(imgDir)) fs.rmSync(imgDir, { recursive: true });
+        } catch {}
+        console.log(`🗑️  Товар "${p.name}" удалён (прошла неделя после деактивации)`);
+        return false;
+      }
+    }
+    return true;
+  });
+  if (filtered.length !== products.length) {
+    writeJSON('products.json', filtered);
+  }
+}
+
+// Запускаем проверку раз в час
+setInterval(purgeExpiredProducts, 60 * 60 * 1000);
+
+// ══════════════════════════════════════
 //  MIDDLEWARE
 // ══════════════════════════════════════
-app.use(cors({
-  origin: FRONTEND_URL,
-  credentials: true
-}));
+app.use(cors({ origin: FRONTEND_URL, credentials: true }));
 app.use(express.json({ limit: '50mb' }));
 app.use('/uploads', express.static(UPLOADS_DIR));
 
-// Отдаём фронтенд (если есть папка public)
 const PUBLIC_DIR = path.join(__dirname, 'public');
 if (fs.existsSync(PUBLIC_DIR)) {
   app.use(express.static(PUBLIC_DIR));
 }
 
-// ── Авторизация ──
 function authMiddleware(req, res, next) {
   const auth = req.headers.authorization;
   if (!auth || !auth.startsWith('Bearer ')) return res.status(401).json({ error: 'Не авторизован' });
@@ -104,18 +123,16 @@ function adminMiddleware(req, res, next) {
   });
 }
 
-// ── Multer: загрузка изображений ──
+// Multer
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
-    const slug = req.params.slug || 'misc';
+    const slug = req.params.slug || req.params.id || 'misc';
     const dir  = path.join(UPLOADS_DIR, slug);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     cb(null, dir);
   },
   filename: (req, file, cb) => {
-    const ext  = path.extname(file.originalname);
-    const name = `${uuidv4()}${ext}`;
-    cb(null, name);
+    cb(null, `${uuidv4()}${path.extname(file.originalname)}`);
   }
 });
 const upload = multer({ storage, limits: { fileSize: 10 * 1024 * 1024 } });
@@ -124,238 +141,236 @@ const upload = multer({ storage, limits: { fileSize: 10 * 1024 * 1024 } });
 //  HEALTH CHECK
 // ══════════════════════════════════════
 app.get('/api', (req, res) => {
-  res.json({ status: 'ok', service: 'NURE Backend v2.0', time: new Date().toISOString() });
+  res.json({ status: 'ok', service: 'NURE Backend v3.0', time: new Date().toISOString() });
 });
 
 // ══════════════════════════════════════
-//  AUTH ROUTES
+//  AUTH
 // ══════════════════════════════════════
-
-// POST /api/auth/register
 app.post('/api/auth/register', async (req, res) => {
   try {
     const { email, password, name } = req.body;
     if (!email || !password || !name) return res.status(400).json({ error: 'Заполните все поля' });
     if (password.length < 6) return res.status(400).json({ error: 'Пароль минимум 6 символов' });
-
     const users = readJSON('users.json', []);
     if (users.find(u => u.email === email)) return res.status(409).json({ error: 'Email уже зарегистрирован' });
-
     const hashed = await bcrypt.hash(password, 10);
-    const user = {
-      id: uuidv4(), email, password: hashed, name,
-      role: 'user', createdAt: new Date().toISOString()
-    };
+    const user = { id: uuidv4(), email, password: hashed, name, role: 'user', createdAt: new Date().toISOString() };
     users.push(user);
     writeJSON('users.json', users);
-
     const token = jwt.sign({ id: user.id, email, name, role: 'user' }, JWT_SECRET, { expiresIn: '30d' });
     res.json({ token, user: { id: user.id, email, name, role: 'user' } });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// POST /api/auth/login
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email || !password) return res.status(400).json({ error: 'Введите email и пароль' });
-
     const users = readJSON('users.json', []);
     const user  = users.find(u => u.email === email);
     if (!user) return res.status(401).json({ error: 'Неверный email или пароль' });
-
     const ok = await bcrypt.compare(password, user.password);
     if (!ok) return res.status(401).json({ error: 'Неверный email или пароль' });
-
     const token = jwt.sign(
       { id: user.id, email: user.email, name: user.name, role: user.role },
       JWT_SECRET, { expiresIn: '30d' }
     );
     res.json({ token, user: { id: user.id, email: user.email, name: user.name, role: user.role } });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// GET /api/auth/me
 app.get('/api/auth/me', authMiddleware, (req, res) => {
   res.json({ user: req.user });
 });
 
-// POST /api/auth/change-password
 app.post('/api/auth/change-password', authMiddleware, async (req, res) => {
   try {
     const { oldPassword, newPassword } = req.body;
     const users = readJSON('users.json', []);
     const user  = users.find(u => u.id === req.user.id);
     if (!user) return res.status(404).json({ error: 'Пользователь не найден' });
-
     const ok = await bcrypt.compare(oldPassword, user.password);
     if (!ok) return res.status(401).json({ error: 'Неверный текущий пароль' });
-
     user.password = await bcrypt.hash(newPassword, 10);
     writeJSON('users.json', users);
     res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ══════════════════════════════════════
-//  PALOMA365 PROXY
+//  ПУБЛИЧНЫЕ МАРШРУТЫ ТОВАРОВ
 // ══════════════════════════════════════
 
-// GET /api/products — товары Paloma + enrichments
-app.get('/api/products', async (req, res) => {
-  try {
-    const url = `${PALOMA_BASE_URL}?method=getProducts&token=${PALOMA_API_KEY}`;
-    const response = await fetch(url, { timeout: 10000 });
-    const data = await response.json();
-
-    const enrichments = readJSON('enrichments.json', {});
-    const products = (data.products || data.data || data || []).map(p => {
-      const slug = slugify(p.name || p.id);
-      const enrich = enrichments[p.id] || enrichments[slug] || {};
-      return { ...p, slug, ...enrich };
-    });
-
-    res.json({ success: true, products });
-  } catch (err) {
-    // Если Paloma недоступна — вернуть только enriched данные
-    const enrichments = readJSON('enrichments.json', {});
-    const manual = Object.entries(enrichments).map(([id, e]) => ({ id, ...e }));
-    res.json({ success: true, products: manual, offline: true });
-  }
+// GET /api/products — все активные + деактивированные (помечены outOfStock)
+app.get('/api/products', (req, res) => {
+  purgeExpiredProducts();
+  const products = readJSON('products.json', []);
+  const visible = products.map(p => ({
+    ...p,
+    outOfStock: !!p.deactivatedAt
+  }));
+  res.json({ success: true, products: visible });
 });
 
 // GET /api/products/:id — один товар
-app.get('/api/products/:id', async (req, res) => {
+app.get('/api/products/:id', (req, res) => {
+  const products = readJSON('products.json', []);
+  const product  = products.find(p => p.id === req.params.id || p.slug === req.params.id);
+  if (!product) return res.status(404).json({ error: 'Товар не найден' });
+  res.json({ success: true, product: { ...product, outOfStock: !!product.deactivatedAt } });
+});
+
+// POST /api/order — создать заказ (сохраняем локально)
+app.post('/api/order', authMiddleware, (req, res) => {
   try {
-    const { id } = req.params;
-    const enrichments = readJSON('enrichments.json', {});
+    const orders = readJSON('orders.json', []);
+    const order  = {
+      id: uuidv4(),
+      userId: req.user.id,
+      ...req.body,
+      status: 'new',
+      createdAt: new Date().toISOString()
+    };
+    orders.push(order);
+    writeJSON('orders.json', orders);
+    res.json({ success: true, order });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
 
-    // Попробуем получить из Paloma
-    let palomaProduct = null;
-    try {
-      const url = `${PALOMA_BASE_URL}?method=getProducts&token=${PALOMA_API_KEY}`;
-      const r   = await fetch(url, { timeout: 8000 });
-      const d   = await r.json();
-      const all = d.products || d.data || d || [];
-      palomaProduct = all.find(p => String(p.id) === String(id));
-    } catch {}
+// ══════════════════════════════════════
+//  ADMIN — ТОВАРЫ
+// ══════════════════════════════════════
 
-    const enrich = enrichments[id] || {};
-    const product = palomaProduct
-      ? { ...palomaProduct, slug: slugify(palomaProduct.name || id), ...enrich }
-      : { id, ...enrich };
+// GET /api/admin/products — все товары для админа (включая деактивированные)
+app.get('/api/admin/products', adminMiddleware, (req, res) => {
+  const products = readJSON('products.json', []);
+  res.json({ success: true, products });
+});
 
+// POST /api/admin/products — создать товар
+app.post('/api/admin/products', adminMiddleware, (req, res) => {
+  try {
+    const { name, price, category, description, badge, sizes, colors } = req.body;
+    if (!name) return res.status(400).json({ error: 'Название обязательно' });
+
+    const products = readJSON('products.json', []);
+    const id   = uuidv4();
+    const slug = slugify(name) + '-' + id.slice(0, 6);
+    const product = {
+      id, slug, name,
+      price:       price || 0,
+      category:    category || '',
+      description: description || '',
+      badge:       badge || '',
+      sizes:       sizes || [],
+      colors:      colors || [],
+      images:      { default: [] },
+      isActive:    true,
+      createdAt:   new Date().toISOString()
+    };
+    products.push(product);
+    writeJSON('products.json', products);
     res.json({ success: true, product });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// GET /api/stock/:id
-app.get('/api/stock/:id', async (req, res) => {
-  try {
-    const url = `${PALOMA_BASE_URL}?method=getStock&token=${PALOMA_API_KEY}&product_id=${req.params.id}`;
-    const r   = await fetch(url, { timeout: 8000 });
-    res.json(await r.json());
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// POST /api/order
-app.post('/api/order', async (req, res) => {
-  try {
-    const payload = { ...req.body, token: PALOMA_API_KEY, method: 'createOrder' };
-    const r = await fetch(PALOMA_BASE_URL, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload), timeout: 10000
-    });
-    res.json(await r.json());
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ══════════════════════════════════════
-//  ADMIN — УПРАВЛЕНИЕ ТОВАРАМИ
-// ══════════════════════════════════════
-
-// GET /api/admin/enrichments — получить все enrichments
-app.get('/api/admin/enrichments', adminMiddleware, (req, res) => {
-  res.json(readJSON('enrichments.json', {}));
-});
-
-// PUT /api/admin/products/:id — обновить описание, категорию, badge товара
+// PUT /api/admin/products/:id — редактировать товар
 app.put('/api/admin/products/:id', adminMiddleware, (req, res) => {
-  const { id } = req.params;
-  const { description, category, badge, sizes, colors, isActive } = req.body;
-  const enrichments = readJSON('enrichments.json', {});
-  enrichments[id] = {
-    ...(enrichments[id] || {}),
-    ...(description !== undefined && { description }),
-    ...(category    !== undefined && { category }),
-    ...(badge       !== undefined && { badge }),
-    ...(sizes       !== undefined && { sizes }),
-    ...(colors      !== undefined && { colors }),
-    ...(isActive    !== undefined && { isActive }),
-    updatedAt: new Date().toISOString()
-  };
-  writeJSON('enrichments.json', enrichments);
-  res.json({ success: true, enrichment: enrichments[id] });
+  try {
+    const products = readJSON('products.json', []);
+    const idx = products.findIndex(p => p.id === req.params.id);
+    if (idx === -1) return res.status(404).json({ error: 'Товар не найден' });
+
+    const allowed = ['name', 'price', 'category', 'description', 'badge', 'sizes', 'colors'];
+    allowed.forEach(key => {
+      if (req.body[key] !== undefined) products[idx][key] = req.body[key];
+    });
+    products[idx].updatedAt = new Date().toISOString();
+    writeJSON('products.json', products);
+    res.json({ success: true, product: products[idx] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// POST /api/admin/products/:slug/images — загрузить фото товара
-app.post('/api/admin/products/:slug/images', adminMiddleware, upload.array('images', 10), (req, res) => {
-  const { slug } = req.params;
-  const colorKey = req.body.colorKey || 'default';
-  const baseUrl  = `${req.protocol}://${req.get('host')}`;
+// POST /api/admin/products/:id/deactivate — деактивировать товар
+app.post('/api/admin/products/:id/deactivate', adminMiddleware, (req, res) => {
+  try {
+    const products = readJSON('products.json', []);
+    const idx = products.findIndex(p => p.id === req.params.id);
+    if (idx === -1) return res.status(404).json({ error: 'Товар не найден' });
 
-  const urls = req.files.map(f => `${baseUrl}/uploads/${slug}/${f.filename}`);
-
-  const enrichments = readJSON('enrichments.json', {});
-  const enrich = enrichments[slug] || {};
-  if (!enrich.images) enrich.images = {};
-  if (!enrich.images[colorKey]) enrich.images[colorKey] = [];
-  enrich.images[colorKey].push(...urls);
-  enrichments[slug] = enrich;
-  writeJSON('enrichments.json', enrichments);
-
-  res.json({ success: true, urls, colorKey });
+    products[idx].isActive     = false;
+    products[idx].deactivatedAt = new Date().toISOString();
+    writeJSON('products.json', products);
+    console.log(`⏸️  Товар "${products[idx].name}" деактивирован — удалится через 7 дней`);
+    res.json({ success: true, product: products[idx] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// DELETE /api/admin/products/:slug/images — удалить фото
-app.delete('/api/admin/products/:slug/images', adminMiddleware, (req, res) => {
-  const { slug } = req.params;
-  const { url, colorKey = 'default' } = req.body;
+// POST /api/admin/products/:id/activate — реактивировать товар
+app.post('/api/admin/products/:id/activate', adminMiddleware, (req, res) => {
+  try {
+    const products = readJSON('products.json', []);
+    const idx = products.findIndex(p => p.id === req.params.id);
+    if (idx === -1) return res.status(404).json({ error: 'Товар не найден' });
 
-  const enrichments = readJSON('enrichments.json', {});
-  const enrich = enrichments[slug] || {};
-  if (enrich.images && enrich.images[colorKey]) {
-    enrich.images[colorKey] = enrich.images[colorKey].filter(u => u !== url);
-    // Удалить файл
-    try {
-      const filename = path.basename(url);
-      fs.unlinkSync(path.join(UPLOADS_DIR, slug, filename));
-    } catch {}
-    enrichments[slug] = enrich;
-    writeJSON('enrichments.json', enrichments);
-  }
-  res.json({ success: true });
+    products[idx].isActive      = true;
+    delete products[idx].deactivatedAt;
+    writeJSON('products.json', products);
+    res.json({ success: true, product: products[idx] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// GET /api/admin/users — список пользователей
+// POST /api/admin/products/:id/images — загрузить фото
+app.post('/api/admin/products/:id/images', adminMiddleware, upload.array('images', 10), (req, res) => {
+  try {
+    const products = readJSON('products.json', []);
+    const idx = products.findIndex(p => p.id === req.params.id);
+    if (idx === -1) return res.status(404).json({ error: 'Товар не найден' });
+
+    const colorKey = req.body.colorKey || 'default';
+    const baseUrl  = `${req.protocol}://${req.get('host')}`;
+    const slug     = products[idx].slug || req.params.id;
+    const urls     = req.files.map(f => `${baseUrl}/uploads/${slug}/${f.filename}`);
+
+    if (!products[idx].images) products[idx].images = {};
+    if (!products[idx].images[colorKey]) products[idx].images[colorKey] = [];
+    products[idx].images[colorKey].push(...urls);
+    writeJSON('products.json', products);
+    res.json({ success: true, urls, colorKey });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// DELETE /api/admin/products/:id/images — удалить фото
+app.delete('/api/admin/products/:id/images', adminMiddleware, (req, res) => {
+  try {
+    const { url, colorKey = 'default' } = req.body;
+    const products = readJSON('products.json', []);
+    const idx = products.findIndex(p => p.id === req.params.id);
+    if (idx === -1) return res.status(404).json({ error: 'Товар не найден' });
+
+    if (products[idx].images && products[idx].images[colorKey]) {
+      products[idx].images[colorKey] = products[idx].images[colorKey].filter(u => u !== url);
+      try {
+        const slug     = products[idx].slug || req.params.id;
+        const filename = path.basename(url);
+        fs.unlinkSync(path.join(UPLOADS_DIR, slug, filename));
+      } catch {}
+      writeJSON('products.json', products);
+    }
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/admin/users
 app.get('/api/admin/users', adminMiddleware, (req, res) => {
-  const users = readJSON('users.json', []).map(u => {
-    const { password, ...safe } = u;
-    return safe;
-  });
+  const users = readJSON('users.json', []).map(({ password, ...safe }) => safe);
   res.json({ users });
+});
+
+// GET /api/admin/orders
+app.get('/api/admin/orders', adminMiddleware, (req, res) => {
+  res.json({ orders: readJSON('orders.json', []) });
 });
 
 // ══════════════════════════════════════
@@ -365,7 +380,7 @@ function slugify(str) {
   return String(str)
     .toLowerCase()
     .replace(/[а-яё]/g, c => {
-      const map = { а:'a',б:'b',в:'v',г:'g',д:'d',е:'e',ё:'yo',ж:'zh',з:'z',и:'i',й:'y',к:'k',л:'l',м:'m',н:'n',о:'o',п:'p',р:'r',с:'s',т:'t',у:'u',ф:'f',х:'h',ц:'ts',ч:'ch',ш:'sh',щ:'sch',ъ:'',ы:'y',ь:'',э:'e',ю:'yu',я:'ya' };
+      const map = {а:'a',б:'b',в:'v',г:'g',д:'d',е:'e',ё:'yo',ж:'zh',з:'z',и:'i',й:'y',к:'k',л:'l',м:'m',н:'n',о:'o',п:'p',р:'r',с:'s',т:'t',у:'u',ф:'f',х:'h',ц:'ts',ч:'ch',ш:'sh',щ:'sch',ъ:'',ы:'y',ь:'',э:'e',ю:'yu',я:'ya'};
       return map[c] || c;
     })
     .replace(/\s+/g, '-')
@@ -374,7 +389,7 @@ function slugify(str) {
     .trim();
 }
 
-// SPA fallback для фронтенда
+// SPA fallback
 if (fs.existsSync(PUBLIC_DIR)) {
   app.get('*', (req, res) => {
     if (!req.path.startsWith('/api') && !req.path.startsWith('/uploads')) {
@@ -389,6 +404,7 @@ if (fs.existsSync(PUBLIC_DIR)) {
 //  ЗАПУСК
 // ══════════════════════════════════════
 initData();
+purgeExpiredProducts();
 app.listen(PORT, () => {
   console.log(`\n🚀 NURE Backend запущен на порту ${PORT}`);
   console.log(`   API: http://localhost:${PORT}/api`);
