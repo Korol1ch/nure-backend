@@ -296,46 +296,6 @@ function groupPalomaItems(items) {
   return products;
 }
 
-// ══════════════════════════════════════
-//  ОТСЛЕЖИВАНИЕ "НЕДАВНО ДОБАВЛЕННЫХ" ТОВАРОВ
-//
-//  Paloma365 не отдаёт дату создания товара, поэтому отслеживаем сами:
-//  при каждой синхронизации сверяем список palomaId с тем, что видели раньше
-//  (data/product-history.json). Новые id получают текущую метку времени —
-//  именно её используем как "дата добавления" для сортировки "Новинки".
-//
-//  Особый случай — самый первый запуск (файл истории пуст): чтобы не считать
-//  весь существующий каталог "добавленным только что" одной пачкой, раздаём
-//  товарам по порядку из Paloma бэкдатированные метки (последний в списке —
-//  самый "свежий"). Любой товар, появившийся уже ПОСЛЕ этого момента,
-//  получит реальное now() и автоматически окажется выше бэкдатированных.
-// ══════════════════════════════════════
-function trackProductHistory(products) {
-  const history = readJSON('product-history.json', {});
-  const isBootstrap = Object.keys(history).length === 0;
-  const now = Date.now();
-  let changed = false;
-  const currentIds = new Set();
-
-  products.forEach((p, idx) => {
-    currentIds.add(p.palomaId);
-    if (!history[p.palomaId]) {
-      history[p.palomaId] = isBootstrap
-        ? now - (products.length - idx) * 1000   // псевдо-хронология по порядку каталога
-        : now;                                     // реально новый товар — метка "сейчас"
-      changed = true;
-    }
-  });
-
-  // Чистим историю от товаров, которых больше нет в каталоге Paloma
-  for (const id of Object.keys(history)) {
-    if (!currentIds.has(id)) { delete history[id]; changed = true; }
-  }
-
-  if (changed) writeJSON('product-history.json', history);
-  return history;
-}
-
 async function getPalomaCatalog(force = false) {
   const now = Date.now();
   if (!force && palomaCache.products.length && (now - palomaCache.fetchedAt) < PALOMA_CACHE_TTL_MS) {
@@ -345,10 +305,6 @@ async function getPalomaCatalog(force = false) {
     const raw  = await fetchPalomaRaw();
     const items = (raw && raw.s_items) || {};
     const products = groupPalomaItems(items);
-
-    // Помечаем каждый товар временем первого появления в нашей системе
-    const history = trackProductHistory(products);
-    products.forEach(p => { p.addedAt = history[p.palomaId] || now; });
 
     // Собираем категории для фильтров
     const categories = {};
@@ -401,7 +357,6 @@ function mergeProduct(p, enrich) {
     hidden:       !!enrich.hidden,
     hasPhotos:    !!(colors.some(c => c.images.length) || defaultImages.length),
     updatedAt:    enrich.updatedAt || null,
-    addedAt:      p.addedAt || null,
   };
 }
 
